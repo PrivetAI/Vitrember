@@ -6,20 +6,29 @@ struct VitremberApp: App {
                                                    checkDomain: VitremberLinks.checkDomain)
     @StateObject private var store = VitremberStore()
     @State private var vitremberPagePainted = false
+    @State private var vitremberPanelDeadEnd = false   // panel loaded nothing; verdict untouched
     @Environment(\.scenePhase) private var scenePhase
+
+    /// Decides WHAT the panel loads after a `true` verdict, never whether it opens.
+    /// Computed, not a `let` in the ViewBuilder (iOS 15 result builders reject it).
+    private var resumeAddress: String? { VitremberPanelSession.resumeAddress() }
+    private var trackerHost: String { URL(string: gate.sourceLink)?.host ?? "" }
 
     var body: some Scene {
         WindowGroup {
             Group {
                 if let ready = gate.ready {
-                    if ready {
+                    if ready && !vitremberPanelDeadEnd {
                         // Web panel. The frame RESPECTS the top safe area, so page
                         // content can never render under the notch, and the opaque black
                         // band above it is drawn in the dark scheme so the clock, Wi-Fi
                         // and battery stay white and readable.
                         ZStack {
-                            VitremberWebPanel(urlString: gate.sourceLink,
-                                         onFirstPaint: { withAnimation { vitremberPagePainted = true } })
+                            VitremberWebPanel(urlString: resumeAddress ?? gate.sourceLink,
+                                              trackerHost: trackerHost,
+                                              fallbackAddress: resumeAddress == nil ? nil : gate.sourceLink,
+                                              onFirstPaint: { withAnimation { vitremberPagePainted = true } },
+                                              onDeadEnd: { vitremberPanelDeadEnd = true })
                                 .edgesIgnoringSafeArea(.bottom)
                                 .background(Color.black.ignoresSafeArea())
                             if !vitremberPagePainted {
@@ -59,6 +68,11 @@ struct VitremberApp: App {
             // a hard cut reads as a glitch.
             .animation(.easeInOut(duration: 0.25), value: gate.ready)
             .onChange(of: scenePhase) { phase in
+                // Last reliable moment before the process can be killed from the switcher.
+                // `.inactive` also fires on the way IN; a snapshot is a read, twice is free.
+                if gate.ready == true, phase != .active {
+                    VitremberPanelCookies.snapshot()
+                }
                 switch phase {
                 case .background:
                     // ONLY here. `.inactive` fires on the way into the background AND on
@@ -109,6 +123,7 @@ final class VitremberLaunchGate: ObservableObject {
     private var lastProgress = Date()
     private var stallTimer: Timer?
     private var task: URLSessionTask?
+    private var session: URLSession?
 
     init(sourceLink: String, checkDomain: String) {
         self.sourceLink = sourceLink
@@ -133,6 +148,9 @@ final class VitremberLaunchGate: ObservableObject {
         // HEAD, never GET. A default GET downloads the whole landing page, throws the
         // body away, and the WebView then fetches the same page again from scratch.
         request.httpMethod = "HEAD"
+        // The one request whose entire value is being LIVE: a 301/308 is cacheable with
+        // no headers at all, and a cached hop answers from a snapshot, not the Worker.
+        request.cachePolicy = .reloadIgnoringLocalCacheData
         request.timeoutInterval = 10
 
         let configuration = URLSessionConfiguration.default
@@ -140,6 +158,11 @@ final class VitremberLaunchGate: ObservableObject {
         // While the loading screen is up, a dead network must fail instantly.
         configuration.waitsForConnectivity = (ready != nil)
         configuration.timeoutIntervalForResource = attemptCeiling
+        configuration.urlCache = nil
+        // The gate is a routing probe, not a visit. URLSession's jar is NOT the WebView's,
+        // so a tracker cookie stored here is a second click identity nothing reads back.
+        configuration.httpCookieStorage = nil
+        configuration.httpShouldSetCookies = false
 
         let watcher = VitremberPathWatcher(checkDomain: checkDomain, ownHost: ownHost)
         watcher.onProgress = { [weak self] in
@@ -153,7 +176,11 @@ final class VitremberLaunchGate: ObservableObject {
         lastProgress = Date()
         armStallWatchdog(attempt: number, token: token)
 
+        self.session = session
         task = session.dataTask(with: request) { [weak self] _, response, error in
+            // A delegate session retains its delegate until invalidated; without this one
+            // watcher per attempt survives for the whole process lifetime.
+            session.finishTasksAndInvalidate()
             Task { @MainActor in
                 guard let self = self, !self.settled, self.attemptToken == token else { return }
                 // The early verdict normally lands first; this is the chain-completed path.
@@ -183,7 +210,7 @@ final class VitremberLaunchGate: ObservableObject {
                 let overCeiling = Date().timeIntervalSince(self.startedAt) > self.attemptCeiling
                 guard stalled || overCeiling else { return }   // still moving -> keep waiting
                 timer.invalidate()
-                self.task?.cancel()
+                self.session?.invalidateAndCancel()   // cancels the task AND frees the delegate
                 self.failed(attempt: number, token: token)
             }
         }
