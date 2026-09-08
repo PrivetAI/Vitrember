@@ -54,7 +54,12 @@ struct VitremberScreen: View {
                     furnaceColumn(width: metrics.innerWidth)
                     benchColumn(width: metrics.innerWidth)
                 }
-                .frame(width: metrics.contentWidth)
+                // innerWidth, NOT contentWidth: the gutters are added by the padding
+                // below, so pinning the stack to the full content width would make this
+                // screen `gutter * 2` wider than the window. A fixed child that wide is
+                // reported straight back up through the shell, dragging the HUD and the
+                // tab bar off the right edge with it.
+                .frame(width: metrics.innerWidth)
                 .padding(.horizontal, metrics.gutter)
                 .padding(.top, 8)
                 .frame(maxWidth: .infinity)
